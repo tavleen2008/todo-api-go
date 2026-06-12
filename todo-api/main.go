@@ -1,16 +1,26 @@
 package main
 
 import (
+	"fmt"
+	"os"
+
+	"github.com/joho/godotenv"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+
+	_ "github.com/lib/pq"
+
 )
 
 type Todo struct {
 	ID    int    `json:"id"`
 	Title string `json:"title"`
+	Completed bool   `json:"completed"`
 }
+var db *sql.DB
 
 var todos = []Todo{
 	{
@@ -25,6 +35,26 @@ var todos = []Todo{
 
 // GET 
 func getTodos(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.Query("SELECT id, title, completed FROM todos")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var todos []Todo
+
+	for rows.Next() {
+		var t Todo
+
+		err := rows.Scan(&t.ID, &t.Title, &t.Completed)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		todos = append(todos, t)
+	}
 	w.Header().Set("Content-Type", "application/json")
 
 	json.NewEncoder(w).Encode(todos)
@@ -42,25 +72,30 @@ func getTodoByID(w http.ResponseWriter, r *http.Request) {
 	idStr := parts[2]
 
 	id, err := strconv.Atoi(idStr)
-
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	for _, todo := range todos {
+	var todo Todo
 
-		if todo.ID == id {
+	err = db.QueryRow(
+		"SELECT id, title, completed FROM todos WHERE id = $1",
+		id,
+	).Scan(&todo.ID, &todo.Title, &todo.Completed)
 
-			w.Header().Set("Content-Type", "application/json")
-
-			json.NewEncoder(w).Encode(todo)
-
-			return
-		}
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(todo)
 }
 
 // POST 
@@ -68,16 +103,25 @@ func createTodo(w http.ResponseWriter, r *http.Request) {
 
 	var todo Todo
 
-	json.NewDecoder(r.Body).Decode(&todo)
+	err := json.NewDecoder(r.Body).Decode(&todo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	todo.ID = len(todos) + 1
+	err = db.QueryRow(
+		"INSERT INTO todos (title, completed) VALUES ($1, $2) RETURNING id",
+		todo.Title,
+		todo.Completed,
+	).Scan(&todo.ID)
 
-	todos = append(todos, todo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-
 	w.WriteHeader(http.StatusCreated)
-
 	json.NewEncoder(w).Encode(todo)
 }
 
@@ -94,7 +138,6 @@ func updateTodo(w http.ResponseWriter, r *http.Request) {
 	idStr := parts[2]
 
 	id, err := strconv.Atoi(idStr)
-
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -102,23 +145,35 @@ func updateTodo(w http.ResponseWriter, r *http.Request) {
 
 	var updatedTodo Todo
 
-	json.NewDecoder(r.Body).Decode(&updatedTodo)
-
-	for i, todo := range todos {
-
-		if todo.ID == id {
-
-			todos[i].Title = updatedTodo.Title
-
-			w.Header().Set("Content-Type", "application/json")
-
-			json.NewEncoder(w).Encode(todos[i])
-
-			return
-		}
+	err = json.NewDecoder(r.Body).Decode(&updatedTodo)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	err = db.QueryRow(
+		"UPDATE todos SET title = $1, completed = $2 WHERE id = $3 RETURNING id, title, completed",
+		updatedTodo.Title,
+		updatedTodo.Completed,
+		id,
+	).Scan(
+		&updatedTodo.ID,
+		&updatedTodo.Title,
+		&updatedTodo.Completed,
+	)
+
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updatedTodo)
 }
 
 // DELETE 
@@ -134,28 +189,33 @@ func deleteTodo(w http.ResponseWriter, r *http.Request) {
 	idStr := parts[2]
 
 	id, err := strconv.Atoi(idStr)
-
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	for i, todo := range todos {
+	result, err := db.Exec(
+		"DELETE FROM todos WHERE id = $1",
+		id,
+	)
 
-		if todo.ID == id {
-
-			todos = append(
-				todos[:i],
-				todos[i+1:]...,
-			)
-
-			w.WriteHeader(http.StatusNoContent)
-
-			return
-		}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if rowsAffected == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 
@@ -198,8 +258,37 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusNotFound)
 }
+func connectDB() {
+
+	err := godotenv.Load()
+	if err != nil {
+		panic("Error loading .env file")
+	}
+
+	connStr := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_NAME"),
+	)
+
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		panic(err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Connected to PostgreSQL!")
+}
 
 func main() {
+	connectDB()
 
 	http.HandleFunc("/todo", todoHandler)
 
